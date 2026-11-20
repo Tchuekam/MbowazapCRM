@@ -167,6 +167,7 @@ export async function POST(req: NextRequest) {
         } catch (_) {}
       }
     }
+    }
 
     const pairingRef = crypto.randomUUID();
     let reservation: Awaited<ReturnType<typeof reservePairing>> | undefined;
