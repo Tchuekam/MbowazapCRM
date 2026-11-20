@@ -30,9 +30,9 @@ function closeSocketQuietly(sock) {
     clearInterval(sock.watchdogInterval);
     clearInterval(sock.heartbeatInterval);
     clearTimeout(sock._presenceTimeout);
-    try { sock.ev?.removeAllListeners(); } catch (_) {}
-    try { sock.end(); } catch (_) {}
-    try { sock.ws?.close(); } catch (_) {}
+    try { sock.ev?.removeAllListeners(); } catch (_) { }
+    try { sock.end(); } catch (_) { }
+    try { sock.ws?.close(); } catch (_) { }
 }
 
 function isTransientQrClose(sock) {

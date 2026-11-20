@@ -34,7 +34,7 @@ async function requestPairing(
   request: PairRequest
 ): Promise<PairResult> {
   const deadline = Date.now() + PAIRING_PENDING_BUDGET_MS;
-  for (;;) {
+  for (; ;) {
     try {
       return await client.pair(request);
     } catch (err) {

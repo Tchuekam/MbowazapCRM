@@ -13,6 +13,18 @@ process.emit = function(name, data, ...args) {
 };
 
 require('dotenv').config();
+const dns = require('dns');
+const https = require('https');
+try {
+    dns.setDefaultResultOrder('ipv4first');
+} catch (_) {}
+
+const ipv4Agent = new https.Agent({
+    family: 4,
+    keepAlive: true,
+    maxSockets: 50,
+});
+
 require('./settings');
 const { Boom } = require('@hapi/boom');
 const fs = require('fs');
@@ -62,8 +74,7 @@ const store = require('./lib/lightweight_store');
 
 // Initialize store
 store.readFromFile();
-const settings = require('dotenv').config();
-require('./settings');
+const settings = require('./settings');
 setInterval(() => store.writeToFile(), settings.storeWriteInterval || 10000);
 
 if (settings.policyGuard?.enabled) {
@@ -183,7 +194,7 @@ async function getWaVersion() {
         // version file can lag WhatsApp by months while still reporting that
         // it is the latest Baileys version, which can make WhatsApp reject a
         // new pairing socket before it emits a QR.
-        const web = await fetchLatestWaWebVersion({ timeout: WA_VERSION_TIMEOUT_MS });
+        const web = await fetchLatestWaWebVersion({ timeout: WA_VERSION_TIMEOUT_MS, httpsAgent: ipv4Agent });
         if (web.isLatest) {
             latestWaVersion = web.version;
             latestWaVersionFetchedAt = Date.now();
@@ -193,7 +204,7 @@ async function getWaVersion() {
 
         // Fall back to Baileys' published revision when web.whatsapp.com is
         // unavailable. Retry the live source sooner after using a fallback.
-        const baileys = await fetchLatestBaileysVersion({ timeout: WA_VERSION_TIMEOUT_MS });
+        const baileys = await fetchLatestBaileysVersion({ timeout: WA_VERSION_TIMEOUT_MS, httpsAgent: ipv4Agent });
         latestWaVersion = baileys.version || web.version;
         latestWaVersionFetchedAt = Date.now() - WA_VERSION_CACHE_TTL_MS + WA_VERSION_FALLBACK_RETRY_MS;
         console.log(chalk.yellow(`[wa-version] Fallback Baileys version: ${latestWaVersion.join('.')}`));
@@ -481,6 +492,7 @@ async function startXeonBotIncUnlocked(phoneNumber = ownerNum) {
             creds: state.creds,
             keys: makeCacheableSignalKeyStore(state.keys, pino({ level: "fatal" }).child({ level: "fatal" })),
         },
+        agent: ipv4Agent,
         markOnlineOnConnect: !(settings.policyGuard?.enabled && settings.policyGuard?.disablePresenceAutomation),
         generateHighQualityLinkPreview: true,
         syncFullHistory: true,
