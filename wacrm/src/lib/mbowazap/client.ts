@@ -50,13 +50,92 @@ export class MbowazapBridgeError extends Error {
   }
 }
 
+/**
+ * The HTTP status and message a wacrm API route should answer with when a
+ * bridge call fails. The bot's own status is not passed through: its 401
+ * means the shared secret is wrong, not that the browser is signed out.
+ */
+export function describeBridgeError(err: MbowazapBridgeError): {
+  status: number;
+  message: string;
+} {
+  switch (err.code) {
+    case 'network_error':
+      return {
+        status: 502,
+        message: `${err.message}. Check MBOWAZAP_BOT_URL and that TchuekBot is running.`,
+      };
+    case 'timeout':
+      return {
+        status: 504,
+        message: `${err.message}. It may be restarting — try again in a moment.`,
+      };
+    case 'bad_response':
+      return {
+        status: 502,
+        message: `${err.message}. TchuekBot may be down, or MBOWAZAP_BOT_URL points at another service.`,
+      };
+    case 'unauthorized':
+      return {
+        status: 502,
+        message:
+          'TchuekBot rejected the request signature: MBOWAZAP_SECRET must be identical in wacrm and TchuekBot.',
+      };
+    case 'unsupported_protocol':
+      return {
+        status: 502,
+        message: 'wacrm and TchuekBot run different bridge protocol versions. Update both.',
+      };
+    case 'bridge_not_configured':
+      return {
+        status: 503,
+        message: 'MBOWAZAP_SECRET is not set on TchuekBot (min 32 characters).',
+      };
+    case 'pairing_busy':
+    case 'pairing_expired':
+    case 'already_connected':
+      return { status: 409, message: err.message };
+    case 'invalid_request':
+      return { status: 400, message: err.message };
+    case 'pairing_pending':
+      return {
+        status: 503,
+        message: 'TchuekBot is still preparing the WhatsApp QR code. Try again in a few seconds.',
+      };
+    case 'pairing_failed': {
+      // Keep non-transient WhatsApp close codes visible. In particular, a
+      // client-version or authentication rejection is not a throttle and
+      // needs a different fix than waiting before retrying.
+      const closeCode = err.message.match(/WhatsApp code (\d+)/i)?.[1];
+      const closedBeforePairing = /closed the connection before pairing|Connection Terminated|Connection Closed|Connection Lost/i.test(
+        err.message
+      );
+      if (
+        closedBeforePairing &&
+        (!closeCode || closeCode === '408' || closeCode === '428')
+      ) {
+        return {
+          status: 502,
+          message:
+            'WhatsApp dropped the pairing connection twice in a row. This can be temporary — wait about a minute and try again. If it persists, check the TchuekBot logs and confirm this WhatsApp account can link another device.',
+        };
+      }
+      return { status: 502, message: err.message };
+    }
+    default:
+      return { status: 502, message: err.message };
+  }
+}
+
 /** Status reads and switches are quick. */
 export const DEFAULT_TIMEOUT_MS = 15_000;
-/**
- * Sends wait behind the bot's per-chat pacing (4–6 s) and global token
- * bucket; pairing waits for a fresh socket to produce a code or QR.
- */
+/** Outbound commands may wait behind the gateway's pacing and token bucket. */
 export const SLOW_TIMEOUT_MS = 45_000;
+/**
+ * Pairing can use two fresh sockets, each with its own 25-second readiness
+ * window, plus a cooldown and a bounded WhatsApp version lookup.
+ */
+export const PAIRING_TIMEOUT_MS = 70_000;
 /**
  * Typing presence is cosmetic and sits on the AI reply path (it is
  * awaited before generation starts), so a stalled bot must not hold a
@@ -75,6 +154,7 @@ export interface MbowazapClientOptions {
 export interface MbowazapClient {
   ping(): Promise<{ protocol: string; time: number }>;
   pair(request: PairRequest): Promise<PairResult>;
+  cancelPairing(request: PairRequest): Promise<{ cancelled: boolean }>;
   getSession(session: string): Promise<SessionInfo>;
   logout(session: string): Promise<{ session: string; status: 'disconnected' }>;
   setBrain(
@@ -185,7 +265,8 @@ export function createMbowazapClient({
   return {
     ping: () => call('GET', BOT_PATHS.ping, undefined, DEFAULT_TIMEOUT_MS),
 
-    pair: (request) => call('POST', BOT_PATHS.pair, request, SLOW_TIMEOUT_MS),
+    pair: (request) => call('POST', BOT_PATHS.pair, request, PAIRING_TIMEOUT_MS),
+    cancelPairing: (request) => call('POST', BOT_PATHS.cancelPairing, request, DEFAULT_TIMEOUT_MS),
 
     getSession: async (session) => {
       assertSession(session, { allowTempQr: true });

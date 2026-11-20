@@ -83,8 +83,12 @@ matching HTTP status.
   `disconnected`.
 - `pairingRef` is a UUID from wacrm. The bot echoes it on the first
   `connection` event after pairing, which is how wacrm knows which
-  account a number now belongs to. There is only one QR socket, so for
-  QR pairing the latest ref wins.
+  account a number now belongs to. The shared QR socket is exclusively reserved to one attempt for two
+  minutes; competing refs receive `409 pairing_busy`. Refreshing the same
+  ref never extends its deadline. After expiry, the old unlinked socket
+  and credentials are discarded before the next owner receives a QR.
+  Code pairings have the same exclusive ownership per phone number.
+  Ownership survives gateway restarts under `data/bridge/pairing-refs.json`.
 - `to` is exactly one of `{ "phone": "2376…" }` or `{ "lid": "…" }`.
 - `/bridge/send` body: `{ session, to, kind, origin, text?, mediaUrl?,
 mimeType?, filename?, quotedId? }`.
@@ -154,9 +158,10 @@ least one of `phone` / `lid`.
 | `type`              | Fields                                                                                                                                              |
 | ------------------- | --------------------------------------------------------------------------------------------------------------------------------------------------- |
 | `connection`        | `status` (`connected` \| `disconnected` \| `logged_out`), `me?: { phone, name? }`, `pairingRef?`, `reason?`                                         |
-| `message`           | `id`, `direction`, `origin`, `chat`, `timestamp` (s), `kind`, `text?`, `media?: { url, mimeType, filename?, sizeBytes? }`, `location?`, `quotedId?` |
+| `message`           | `id`, `direction`, `origin`, `chat`, `timestamp` (s), `kind`, `text?`, `media?: { url, mimeType, filename?, sizeBytes? }`, `location?`, `quotedId?`, `history?` |
 | `status`            | `id`, `chat`, `status` (`sent` \| `delivered` \| `read` \| `failed`)                                                                                |
 | `reaction`          | `id`, `chat`, `targetId`, `emoji` (`""` = removed), `fromMe`                                                                                        |
+| `contact.upsert`    | `chat`, `name?` (WhatsApp address-book name; never overwrites a CRM-managed name)                                                                    |
 | `contact.facts`     | `chat`, `facts: { name?, businessType?, location?, interestedPack? }` (at least one)                                                                |
 | `deal.closed`       | `chat`, `pack?`                                                                                                                                     |
 | `tally.submitted`   | `chat`                                                                                                                                              |
@@ -171,6 +176,17 @@ For `message` events:
   `"outbound"` goes with `"davila"` (the assistant replied) or
   `"phone"` (typed on the paired phone).
 - Messages wacrm sent through `/bridge/send` are not echoed back.
+- History messages carry `history: true`. They are saved and may update a
+  conversation preview, but do not increment unread, reopen closed threads,
+  or run flows, automations, AI replies, or webhooks.
+
+The bot also forwards Baileys `messaging-history.set`, `contacts.upsert`
+and `contacts.update` data through message and `contact.upsert` events.
+This imports the history and contact snapshots WhatsApp makes
+available to the linked device; redelivered history is safe because
+messages and contact facts are idempotent. Only one-to-one chats are
+mirrored (wacrm does not model group conversations), and WhatsApp names
+only replace blank or phone-number placeholder names in the CRM.
 
 `parseEventBatch` in `protocol.ts` validates a batch:
 
@@ -252,3 +268,30 @@ Meta-only features answer 409 on a MboWazap account: templates,
 broadcasts, the Meta media proxy and registration checks. The Cloud
 API configuration route refuses to save or delete while MboWazap holds
 the account's single connection.
+
+## Pairing ownership and deployment
+
+Deploy the CRM and gateway changes together. No new database migration is
+needed; migration 043's unique phone index is required. Run one gateway
+process for its session data directory, with persistent `data/sessions/`
+and `data/bridge/` storage.
+
+The CRM reserves its configuration row and phone before asking the gateway
+to generate a code. Conditional writes prevent concurrent tabs from replacing
+one another. Failures roll back only their own pending reservation; stale
+connection callbacks cannot claim a replacement reservation.
+
+`POST /bridge/pair/cancel` accepts the same request shape as `/bridge/pair`.
+It cancels only the matching owner and destroys the unlinked socket before
+releasing the reservation. Cancellation during generation returns
+`pairing_busy`; cancellation of an already linked socket is refused.
+The settings screen uses the authenticated `/api/mbowazap/pair/cancel` route.
+
+When `MBOWAZAP_SECRET` is set, the unsigned standalone dashboard, pairing,
+configuration, send, and disconnect routes are disabled, as is CLI pairing.
+The health probe, signed bridge, and existing Tally webhook remain available. Start pairing
+from the authenticated CRM settings screen.
+
+Pairing requests accept 8–15 digits including the country code. Attempt
+expiry is enforced by QR refresh, polling, gateway ownership, and connection
+event ingestion. `pairing_busy` and `pairing_expired` are HTTP 409 errors.

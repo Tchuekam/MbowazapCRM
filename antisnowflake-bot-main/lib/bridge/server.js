@@ -18,6 +18,7 @@
  */
 
 const fs = require('fs');
+const { createPairingGuard } = require('./pairingGuard');
 const path = require('path');
 const { verifyRequest, createNonceCache, readSecret, PROTOCOL_VERSION } = require('./signature');
 const {
@@ -25,6 +26,7 @@ const {
     BridgeError,
     assertSession,
     assertContact,
+    assertPairingRef,
     recipientJid,
     recipientKey,
     parsePairRequest,
@@ -47,6 +49,8 @@ const SESSIONS_ROOT = path.join(__dirname, '../../data/sessions');
 const ROUTES = [
     { method: 'GET', pattern: /^\/bridge\/ping$/, name: 'ping' },
     { method: 'POST', pattern: /^\/bridge\/pair$/, name: 'pair' },
+    { method: 'POST', pattern: /^\/bridge\/pair\/cancel$/, name: 'cancelPairing' },
+    { method: 'GET', pattern: /^\/bridge\/pairings\/([^/]+)$/, name: 'pairing', param: 'pairingRef' },
     { method: 'GET', pattern: /^\/bridge\/sessions\/([^/]+)$/, name: 'session', param: 'session' },
     { method: 'POST', pattern: /^\/bridge\/sessions\/([^/]+)\/logout$/, name: 'logout', param: 'session' },
     { method: 'PUT', pattern: /^\/bridge\/sessions\/([^/]+)\/brain$/, name: 'brain', param: 'session' },
@@ -64,9 +68,41 @@ function productionDeps() {
         getSocket: (session) => sessionManager.getSocket(session),
         deleteSocket: (session) => sessionManager.deleteSocket(session),
         isSocketOpen: (sock) => sessionManager.isSocketOpen(sock),
+        isLinked: (sock) => sessionManager.isLinked(sock),
         requestPairingCode: (phone) => {
             const request = global.requestPairingCodeForNumber || require('../pairServer').generatePairCode;
             return request(phone);
+        },
+        cancelReconnect: (session) => {
+            if (typeof global.cancelReconnectForNumber === 'function') {
+                global.cancelReconnectForNumber(session);
+            }
+        },
+        resetPairingSession: (session) => {
+            if (typeof global.cancelReconnectForNumber === 'function') {
+                global.cancelReconnectForNumber(session);
+            }
+            const sock = sessionManager.getSocket(session);
+            if (sessionManager.isLinked(sock)) {
+                throw new BridgeError(409, 'already_connected', 'This device has already linked. Wait for connection confirmation.');
+            }
+            // A startup/restart may have linked credentials on disk but no socket yet.
+            // Corrupted/truncated creds.json is treated as unlinked and cleaned up.
+            if (sessionManager.isLinkedOnDisk(session, SESSIONS_ROOT)) {
+                throw new BridgeError(409, 'already_connected', 'This device is already linked.');
+            }
+            const dir = path.join(SESSIONS_ROOT, session);
+            if (sock) {
+                sock._manuallyEnded = true;
+                clearInterval(sock.watchdogInterval);
+                clearInterval(sock.heartbeatInterval);
+                clearTimeout(sock._presenceTimeout);
+                sock.ev?.removeAllListeners();
+                try { sock.end(); } catch (_) {}
+                try { sock.ws?.close(); } catch (_) {}
+                sessionManager.deleteSocket(session);
+            }
+            fs.rmSync(dir, { recursive: true, force: true });
         },
         getTempQr: () => require('../qrSession').getTempQrDataUrl(),
         removeSessionFiles: (session) =>
@@ -95,23 +131,57 @@ function sendError(res, status, code, message) {
 
 function readBody(req, limit) {
     return new Promise((resolve, reject) => {
+        let settled = false;
         const declared = Number(req.headers['content-length']);
         if (Number.isFinite(declared) && declared > limit) {
             req.resume();
             reject(new BridgeError(413, 'payload_too_large', `Body is larger than ${limit} bytes`));
             return;
         }
+
         const chunks = [];
         let size = 0;
-        req.on('data', (chunk) => {
+
+        function cleanup() {
+            req.removeListener('data', onData);
+            req.removeListener('end', onEnd);
+            req.removeListener('error', onError);
+        }
+
+        function onData(chunk) {
+            if (settled) return;
             size += chunk.length;
-            if (size <= limit) chunks.push(chunk);
-        });
-        req.on('end', () => {
-            if (size > limit) reject(new BridgeError(413, 'payload_too_large', `Body is larger than ${limit} bytes`));
-            else resolve(Buffer.concat(chunks));
-        });
-        req.on('error', reject);
+            if (size <= limit) {
+                chunks.push(chunk);
+            } else {
+                settled = true;
+                cleanup();
+                req.resume();
+                reject(new BridgeError(413, 'payload_too_large', `Body is larger than ${limit} bytes`));
+            }
+        }
+
+        function onEnd() {
+            if (settled) return;
+            settled = true;
+            cleanup();
+            if (size > limit) {
+                reject(new BridgeError(413, 'payload_too_large', `Body is larger than ${limit} bytes`));
+            } else {
+                resolve(Buffer.concat(chunks));
+            }
+        }
+
+        function onError(err) {
+            if (settled) return;
+            settled = true;
+            cleanup();
+            reject(err);
+        }
+
+        req.on('data', onData);
+        req.on('end', onEnd);
+        req.on('error', onError);
     });
 }
 
@@ -166,15 +236,16 @@ function loggedOutError() {
 function createBridgeHandler(overrides = {}) {
     const d = { ...productionDeps(), ...overrides };
     const nonceCache = createNonceCache();
+    const withPairing = createPairingGuard(d);
 
     function sessionStatus(sock) {
         if (!sock) return 'disconnected';
-        if (!sock.authState?.creds?.registered) return 'pairing';
+        if (!d.isLinked(sock)) return 'pairing';
         return d.isSocketOpen(sock) ? 'connected' : 'reconnecting';
     }
 
     function describeMe(sock) {
-        if (!sock?.user?.id || !sock.authState?.creds?.registered) return null;
+        if (!sock?.user?.id || !d.isLinked(sock)) return null;
         return {
             phone: contactKeyFromJid(sock.user.id),
             name: sock.user.name || sock.user.verifiedName || sock.user.notify || null,
@@ -194,38 +265,109 @@ function createBridgeHandler(overrides = {}) {
             return { protocol: PROTOCOL_VERSION, time: d.now() };
         },
 
+        async cancelPairing(body) {
+            const cmd = parsePairRequest(body);
+            withPairing.cancel(cmd.method === 'code' ? cmd.phone : TEMP_QR_SESSION, cmd.pairingRef);
+            return { cancelled: true };
+        },
+
         async pair(body) {
             const cmd = parsePairRequest(body);
-            if (cmd.method === 'code') {
-                const status = sessionStatus(d.getSocket(cmd.phone));
-                if (status === 'connected' || status === 'reconnecting') {
-                    throw new BridgeError(409, 'already_connected', `${cmd.phone} is already linked`);
+            const session = cmd.method === 'code' ? cmd.phone : TEMP_QR_SESSION;
+            if (d.isLinked(d.getSocket(session))) {
+                if (cmd.method === 'qr') {
+                    // temp_qr just finished scanning and is being migrated to its number.
+                    throw new BridgeError(503, 'pairing_pending', 'QR scan is being finalized. Wait for the device to finish linking.');
                 }
-                d.state.setPairingRef(cmd.phone, cmd.pairingRef);
-                let result;
-                try {
-                    result = await d.requestPairingCode(cmd.phone);
-                } catch (err) {
-                    throw new BridgeError(502, 'pairing_failed', err.message || 'Pairing failed');
-                }
-                if (result?.isConnected) {
-                    d.state.clearPairingRef(cmd.phone);
-                    throw new BridgeError(409, 'already_connected', `${cmd.phone} is already linked`);
-                }
-                if (!result?.code) {
-                    throw new BridgeError(502, 'pairing_failed', result?.error || 'No pairing code was returned');
-                }
-                return { method: 'code', code: result.code, session: cmd.phone };
+                throw new BridgeError(409, 'already_connected', `${session} is already linked`);
             }
+            return withPairing(session, cmd.pairingRef, async () => {
+                if (cmd.method === 'code') {
+                    const status = sessionStatus(d.getSocket(cmd.phone));
+                    if (status === 'connected' || status === 'reconnecting') {
+                        throw new BridgeError(409, 'already_connected', `${cmd.phone} is already linked`);
+                    }
 
-            // One temp_qr socket serves every QR pairing, so the latest ref wins.
-            d.state.setPairingRef(TEMP_QR_SESSION, cmd.pairingRef);
-            const qr = await d.getTempQr();
-            if (qr?.qr) return { method: 'qr', qr: qr.qr, session: TEMP_QR_SESSION };
-            if (qr?.status === 200) {
-                throw new BridgeError(503, 'pairing_pending', qr.error || 'QR code not generated yet; retry shortly');
+                    let result;
+                    try {
+                        result = await d.requestPairingCode(cmd.phone);
+                    } catch (err) {
+                        throw new BridgeError(502, 'pairing_failed', err.message || 'Pairing failed');
+                    }
+                    if (result?.isConnected) {
+                        d.state.clearPairingRef(cmd.phone);
+                        throw new BridgeError(409, 'already_connected', `${cmd.phone} is already linked`);
+                    }
+                    if (!result?.code) {
+                        throw new BridgeError(502, 'pairing_failed', result?.error || 'No pairing code was returned');
+                    }
+                    return { method: 'code', code: result.code, session: cmd.phone };
+                }
+
+                // The shared QR socket is exclusively leased to this pairing ref.
+                const qr = await d.getTempQr();
+                if (qr?.qr) return { method: 'qr', qr: qr.qr, session: TEMP_QR_SESSION };
+                if (qr?.status === 200) {
+                    throw new BridgeError(503, 'pairing_pending', qr.error || 'QR code not generated yet; retry shortly');
+                }
+                throw new BridgeError(502, 'pairing_failed', qr?.error || 'QR code could not be generated');
+            });
+        },
+
+        async pairing(_body, { pairingRef }) {
+            assertPairingRef(pairingRef);
+            const recorded = d.state.getPairingStatus?.(pairingRef) || null;
+            if (recorded && (recorded.state === 'connected' || recorded.state === 'failed')) {
+                return {
+                    pairingRef,
+                    state: recorded.state,
+                    session: recorded.session || undefined,
+                    me: recorded.me || undefined,
+                    reason: recorded.reason || undefined,
+                };
             }
-            throw new BridgeError(502, 'pairing_failed', qr?.error || 'QR code could not be generated');
+            const lease = d.state.findPairingLeaseByRef?.(pairingRef) || null;
+            if (lease) {
+                const sock = d.getSocket(lease.session);
+                if (lease.session !== TEMP_QR_SESSION && sock && d.isLinked(sock)) {
+                    const liveStatus = sessionStatus(sock);
+                    if (liveStatus === 'connected') {
+                        return {
+                            pairingRef,
+                            state: 'connected',
+                            session: lease.session,
+                            me: describeMe(sock),
+                        };
+                    }
+                    return {
+                        pairingRef,
+                        state: 'linking',
+                        session: lease.session,
+                    };
+                }
+                if (lease.session === TEMP_QR_SESSION && sock && d.isLinked(sock)) {
+                    return {
+                        pairingRef,
+                        state: 'linking',
+                        session: recorded?.session || undefined,
+                    };
+                }
+                return {
+                    pairingRef,
+                    state: recorded?.state || 'waiting',
+                    session: recorded?.session || (lease.session !== TEMP_QR_SESSION ? lease.session : undefined),
+                };
+            }
+            if (recorded) {
+                return {
+                    pairingRef,
+                    state: recorded.state,
+                    session: recorded.session || undefined,
+                    me: recorded.me || undefined,
+                    reason: recorded.reason || undefined,
+                };
+            }
+            return { pairingRef, state: 'unknown' };
         },
 
         async session(_body, { session }) {
@@ -241,13 +383,20 @@ function createBridgeHandler(overrides = {}) {
 
         async logout(_body, { session }) {
             assertSession(session);
+            d.cancelReconnect?.(session);
             const sock = d.getSocket(session);
             if (sock) {
+                sock._manuallyEnded = true;
+                clearInterval(sock.watchdogInterval);
+                clearInterval(sock.heartbeatInterval);
+                clearTimeout(sock._presenceTimeout);
                 try {
                     await withTimeout(Promise.resolve(sock.logout()), LOGOUT_TIMEOUT_MS);
                 } catch (_) {
                     try { sock.end(loggedOutError()); } catch (_) {}
                 }
+                try { sock.ev?.removeAllListeners(); } catch (_) {}
+                try { sock.ws?.close(); } catch (_) {}
                 d.deleteSocket(session);
             }
             d.removeSessionFiles(session);

@@ -1,12 +1,65 @@
 import { NextRequest, NextResponse } from 'next/server';
 import { requireRole, toErrorResponse } from '@/lib/auth/account';
 import { readMbowazapEnv } from '@/lib/mbowazap/env';
-import { createMbowazapClient, MbowazapBridgeError } from '@/lib/mbowazap/client';
-import { SESSION_PATTERN } from '@/lib/mbowazap/protocol';
+import {
+  createMbowazapClient,
+  describeBridgeError,
+  MbowazapBridgeError,
+  type MbowazapClient,
+} from '@/lib/mbowazap/client';
+import { type PairRequest, type PairResult } from '@/lib/mbowazap/protocol';
+
+import {
+  reservePairing,
+  type PairingConfig,
+} from '@/lib/mbowazap/pairing-reservation';
 
 export const dynamic = 'force-dynamic';
 
 const PAIRING_EXPIRY_SECONDS = 120;
+/**
+ * How long to keep asking while TchuekBot's QR socket is still starting
+ * (it answers `pairing_pending` until WhatsApp hands out the first QR).
+ */
+const PAIRING_PENDING_BUDGET_MS = 30_000;
+const PAIRING_PENDING_RETRY_MS = 2_000;
+
+async function requestPairing(
+  client: MbowazapClient,
+  request: PairRequest
+): Promise<PairResult> {
+  const deadline = Date.now() + PAIRING_PENDING_BUDGET_MS;
+  for (;;) {
+    try {
+      return await client.pair(request);
+    } catch (err) {
+      const pending =
+        err instanceof MbowazapBridgeError && err.code === 'pairing_pending';
+      if (!pending || Date.now() + PAIRING_PENDING_RETRY_MS > deadline)
+        throw err;
+      await new Promise((r) => setTimeout(r, PAIRING_PENDING_RETRY_MS));
+    }
+  }
+}
+
+/**
+ * Whether TchuekBot still holds a live link for `session`. wacrm's stored
+ * state lags behind the bot (a redeploy without a persistent volume drops
+ * every session, for one), and trusting it alone left admins unable to
+ * re-pair a number the UI already showed as disconnected.
+ */
+async function isStillLinkedOnBot(
+  client: MbowazapClient,
+  session: string
+): Promise<boolean> {
+  try {
+    const live = await client.getSession(session);
+    return live.status === 'connected' || live.status === 'reconnecting';
+  } catch {
+    // Can't tell: keep the stored state authoritative.
+    return true;
+  }
+}
 
 export async function POST(req: NextRequest) {
   try {
@@ -42,25 +95,42 @@ export async function POST(req: NextRequest) {
     let cleanPhone: string | undefined;
     if (method === 'code') {
       cleanPhone = String(phone ?? '').replace(/[^0-9]/g, '');
-      if (!SESSION_PATTERN.test(cleanPhone)) {
+      if (!/^\d{8,15}$/.test(cleanPhone)) {
         return NextResponse.json(
           {
             ok: false,
-            error: 'Phone number must be between 6 and 15 digits (e.g. 237653683174)',
+            error:
+              'Phone number must be between 8 and 15 digits (e.g. 237653683174)',
           },
           { status: 400 }
         );
       }
     }
 
-    // Check if account already has an active connected session
-    const { data: existingConfig } = await ctx.supabase
+    const { data: existingConfig, error: existingError } = await ctx.supabase
       .from('whatsapp_config')
-      .select('mbowazap_state, mbowazap_session, mbowazap_pairing_ref, updated_at')
+      .select('*')
       .eq('account_id', ctx.accountId)
       .maybeSingle();
 
-    if (existingConfig?.mbowazap_state === 'connected' && existingConfig.mbowazap_session) {
+    if (existingError) {
+      console.error(
+        '[mbowazap/pair] error loading whatsapp_config:',
+        existingError
+      );
+      return NextResponse.json(
+        { ok: false, error: 'Failed to load WhatsApp configuration' },
+        { status: 500 }
+      );
+    }
+
+    const client = createMbowazapClient(envResult.env);
+
+    if (
+      existingConfig?.mbowazap_state === 'connected' &&
+      existingConfig.mbowazap_session &&
+      (await isStillLinkedOnBot(client, existingConfig.mbowazap_session))
+    ) {
       return NextResponse.json(
         {
           ok: false,
@@ -72,61 +142,51 @@ export async function POST(req: NextRequest) {
     }
 
     const pairingRef = crypto.randomUUID();
-    const now = new Date();
-    const nowIso = now.toISOString();
-    const expiresAt = new Date(now.getTime() + PAIRING_EXPIRY_SECONDS * 1000).toISOString();
-
-    const { error: upsertError } = await ctx.supabase
-      .from('whatsapp_config')
-      .upsert(
-        {
-          account_id: ctx.accountId,
-          user_id: ctx.userId,
-          provider: 'mbowazap',
-          mbowazap_pairing_ref: pairingRef,
-          mbowazap_state: 'pairing',
-          status: 'disconnected',
-          mbowazap_session: cleanPhone ?? null,
-          mbowazap_brain: 'tchuekbot',
-          updated_at: nowIso,
-        },
-        { onConflict: 'account_id' }
-      );
-
-    if (upsertError) {
-      console.error('[mbowazap/pair] error preparing whatsapp_config:', upsertError);
-      return NextResponse.json(
-        { ok: false, error: `Database error: ${upsertError.message}` },
-        { status: 500 }
-      );
-    }
-
-    const client = createMbowazapClient(envResult.env);
-    let pairResult;
-
+    let reservation: Awaited<ReturnType<typeof reservePairing>> | undefined;
+    let pairResult: PairResult;
     try {
-      pairResult = await client.pair(
+      reservation = await reservePairing(
+        ctx.supabase,
+        ctx.accountId,
+        ctx.userId,
+        existingConfig as PairingConfig | null,
+        pairingRef,
+        cleanPhone ?? null
+      );
+      pairResult = await requestPairing(
+        client,
         method === 'code'
           ? { pairingRef, method: 'code', phone: cleanPhone! }
           : { pairingRef, method: 'qr' }
       );
-    } catch (firstErr) {
-      // If QR generation is pending on a newly initialized socket, wait 2.5s and retry once
-      if (
-        method === 'qr' &&
-        firstErr instanceof MbowazapBridgeError &&
-        firstErr.code === 'pairing_pending'
-      ) {
-        await new Promise((r) => setTimeout(r, 2500));
-        pairResult = await client.pair({ pairingRef, method: 'qr' });
-      } else if (firstErr instanceof MbowazapBridgeError) {
-        return NextResponse.json(
-          { ok: false, error: firstErr.message, code: firstErr.code },
-          { status: firstErr.httpStatus || 502 }
+      if (Date.now() >= Date.parse(reservation.expiresAt)) {
+        throw new MbowazapBridgeError(
+          'pairing_expired',
+          'Pairing took too long. Please try again.'
         );
-      } else {
-        throw firstErr;
       }
+    } catch (err) {
+      if (reservation) {
+        try {
+          await client.cancelPairing(
+            method === 'code'
+              ? { method: 'code', phone: cleanPhone!, pairingRef }
+              : { method: 'qr', pairingRef }
+          );
+        } catch (cleanupError) {
+          console.warn(
+            '[mbowazap/pair] gateway cleanup deferred to expiry:',
+            cleanupError
+          );
+        }
+        await reservation.rollback();
+      }
+      if (!(err instanceof MbowazapBridgeError)) throw err;
+      const { status, message } = describeBridgeError(err);
+      return NextResponse.json(
+        { ok: false, error: message, code: err.code },
+        { status }
+      );
     }
 
     return NextResponse.json({
@@ -137,7 +197,7 @@ export async function POST(req: NextRequest) {
       qr: 'qr' in pairResult ? pairResult.qr : undefined,
       session: pairResult.session,
       pairingRef,
-      expiresAt,
+      expiresAt: reservation.expiresAt,
       expiresInSeconds: PAIRING_EXPIRY_SECONDS,
     });
   } catch (err) {

@@ -64,6 +64,8 @@ function setup(
       provider: 'mbowazap',
       mbowazap_session: opts.session === undefined ? SESSION : opts.session,
       mbowazap_pairing_ref: REF,
+      mbowazap_state: opts.session === null ? 'pairing' : 'connected',
+      updated_at: new Date(NOW).toISOString(),
       mbowazap_brain: opts.brain ?? 'tchuekbot',
       status: 'disconnected',
     },
@@ -147,6 +149,49 @@ describe('inbound messages', () => {
     expect(h.lifecycle).toHaveBeenCalledTimes(1);
   });
 
+  it('stores history without unread counts or replaying inbound workflows', async () => {
+    const { db, run, flush, one } = setup();
+    await run(msg({ id: 'HISTORY1', history: true, text: 'Earlier message' }));
+
+    expect(one('messages')).toMatchObject({
+      message_id: 'HISTORY1',
+      content_text: 'Earlier message',
+      sender_type: 'customer',
+    });
+    expect(one('conversations').unread_count ?? 0).toBe(0);
+    expect(one('conversations').last_message_text).toBe('Earlier message');
+    await flush();
+    expect(h.lifecycle).not.toHaveBeenCalled();
+    expect(h.webhook).not.toHaveBeenCalled();
+    expect(h.automations).not.toHaveBeenCalled();
+    expect(db.rows('messages')).toHaveLength(1);
+  });
+
+  it('creates address-book contacts without creating conversations and preserves CRM names', async () => {
+    const { db, run, one } = setup();
+    await run(ev('contact.upsert', {
+      chat: { phone: CUSTOMER, pushName: 'Address book name' },
+      name: 'Address book name',
+    }));
+    expect(one('contacts')).toMatchObject({ phone: CUSTOMER, name: 'Address book name' });
+    expect(db.rows('conversations')).toHaveLength(0);
+
+    db.seed('contacts', [{
+      id: 'crm-contact',
+      account_id: 'acc-1',
+      user_id: 'owner-1',
+      phone: '237699000002',
+      name: 'CRM curated name',
+      wa_lid: null,
+    }]);
+    await run(ev('contact.upsert', {
+      chat: { phone: '237699000002', pushName: 'WhatsApp name' },
+      name: 'WhatsApp name',
+    }));
+    expect(db.rows('contacts').find((contact) => contact.id === 'crm-contact')?.name)
+      .toBe('CRM curated name');
+  });
+
   it('let the wacrm reply engines answer when wacrm is the brain', async () => {
     const { run, flush } = setup({ brain: 'wacrm' });
     await run(msg({ id: 'IN1' }));
@@ -226,6 +271,34 @@ describe('contact identity', () => {
     await run(msg({ id: 'P1' }));
     await run(msg({ id: 'P2', chat: { phone: CUSTOMER, lid: LID } }));
     expect(one('contacts')).toMatchObject({ phone: CUSTOMER, wa_lid: LID });
+  });
+
+  it('fills a real name onto new and legacy LID-only contacts', async () => {
+    const { db, run, one } = setup();
+    await run(msg({ id: 'LID1', chat: { lid: LID } }));
+    expect(one('contacts')).toMatchObject({ phone: '', wa_lid: LID, name: '' });
+
+    await run(ev('contact.upsert', {
+      chat: { lid: LID },
+      name: 'LID Contact Name',
+    }));
+    expect(one('contacts').name).toBe('LID Contact Name');
+
+    const legacyLid = '123456789013';
+    db.seed('contacts', [{
+      id: 'legacy-lid-contact',
+      account_id: 'acc-1',
+      user_id: 'owner-1',
+      phone: '',
+      name: legacyLid,
+      wa_lid: legacyLid,
+    }]);
+    await run(ev('contact.upsert', {
+      chat: { lid: legacyLid },
+      name: 'Legacy Contact Name',
+    }));
+    expect(db.rows('contacts').find((contact) => contact.id === 'legacy-lid-contact')?.name)
+      .toBe('Legacy Contact Name');
   });
 
   it('merges existing LID-only and Phone-only contacts when dual identifiers arrive', async () => {
@@ -342,6 +415,21 @@ describe('connection and pairing', () => {
       ev('connection', { status: 'connected', me: { phone: SESSION }, pairingRef: REF })
     );
     expect(result.rejected[0].error).toMatch(/pairing 237611111111/);
+  });
+
+  it('rejects a stale code callback even when the phone matches the pending reservation', async () => {
+    const { run, one } = setup();
+    one('whatsapp_config').mbowazap_state = 'pairing';
+    const result = await run(ev('connection', { status: 'connected', pairingRef: 'old-ref' }));
+    expect(result.rejected[0].error).toMatch(/replaced/);
+    expect(one('whatsapp_config').mbowazap_state).toBe('pairing');
+  });
+
+  it('rejects confirmation after the pairing deadline', async () => {
+    const { run, one } = setup({ session: null });
+    const result = await run(ev('connection', { status: 'connected', pairingRef: REF, at: NOW + 120001 }));
+    expect(result.rejected[0].error).toMatch(/expired/);
+    expect(one('whatsapp_config').mbowazap_session).toBeNull();
   });
 
   it('mirrors disconnects and logouts', async () => {

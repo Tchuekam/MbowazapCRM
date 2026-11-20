@@ -13,11 +13,14 @@ const SESSION = '237600000001';
 const CUSTOMER = '237699999999';
 const REF = '1b4e28ba-2fa1-41d2-883f-0016d3cca427';
 
-function fakeSocket({ phone = SESSION, registered = true, open = true } = {}) {
+function fakeSocket({ phone = SESSION, registered = true, open = true, qrLinked = false } = {}) {
+    // Baileys never sets `registered` for a QR-linked device; it only
+    // stores the signed device identity (`account`) on pair-success.
+    const creds = qrLinked ? { registered: false, account: { details: 'signed-identity' } } : { registered };
     return {
         open,
-        authState: { creds: { registered } },
-        user: registered ? { id: `${phone}:7@s.whatsapp.net`, name: 'Tchuek-Tech' } : undefined,
+        authState: { creds },
+        user: registered || qrLinked ? { id: `${phone}:7@s.whatsapp.net`, name: 'Tchuek-Tech' } : undefined,
         sent: [],
         presenceUpdates: [],
         failSend: false,
@@ -61,6 +64,7 @@ async function startBridge(t, overrides = {}) {
             pairingCalls.push(phone);
             return { code: 'ABCD-EFGH', isConnected: false };
         },
+        resetPairingSession: (session) => { sockets.delete(session); },
         getTempQr: async () => ({ status: 200, qr: 'data:image/png;base64,QUJD' }),
         removeSessionFiles: (session) => removed.push(session),
         loadMessage: async () => null,
@@ -152,6 +156,45 @@ test('pair refuses a number that is already linked', async (t) => {
     assert.equal(json.error.code, 'already_connected');
     assert.deepEqual(pairingCalls, []);
     assert.equal(state.getPairingRef(SESSION), null);
+});
+
+test('pair refuses a number that is already linked via QR', async (t) => {
+    const { call, sockets, pairingCalls } = await startBridge(t);
+    sockets.set(SESSION, fakeSocket({ registered: false, qrLinked: true }));
+    const { status, json } = await call('POST', '/bridge/pair', { pairingRef: REF, method: 'code', phone: SESSION });
+    assert.equal(status, 409);
+    assert.equal(json.error.code, 'already_connected');
+    assert.deepEqual(pairingCalls, []);
+});
+
+test('pair via QR surfaces a closed QR socket as pairing_failed', async (t) => {
+    const { call } = await startBridge(t, {
+        getTempQr: async () => ({ status: 502, qr: null, error: 'WhatsApp closed the QR socket before sending a QR code' }),
+    });
+    const { status, json } = await call('POST', '/bridge/pair', { pairingRef: REF, method: 'qr' });
+    assert.equal(status, 502);
+    assert.equal(json.error.code, 'pairing_failed');
+    assert.match(json.error.message, /closed the QR socket/);
+});
+
+test('a QR-linked number reports connected and can send', async (t) => {
+    const { call, sockets } = await startBridge(t);
+    const sock = fakeSocket({ registered: false, qrLinked: true });
+    sockets.set(SESSION, sock);
+
+    const session = await call('GET', `/bridge/sessions/${SESSION}`);
+    assert.equal(session.json.status, 'connected');
+    assert.deepEqual(session.json.me, { phone: SESSION, name: 'Tchuek-Tech' });
+
+    const sent = await call('POST', '/bridge/send', {
+        session: SESSION,
+        to: { phone: CUSTOMER },
+        kind: 'text',
+        origin: 'automation',
+        text: 'Bonjour',
+    });
+    assert.equal(sent.status, 200);
+    assert.equal(sock.sent.length, 1);
 });
 
 test('pair via QR returns the data URL, or pairing_pending while it is generated', async (t) => {
@@ -462,4 +505,66 @@ test('presence answers presence_failed instead of hanging when the socket stalls
     });
     assert.equal(res.status, 502);
     assert.equal(res.json.error.code, 'presence_failed');
+});
+
+const OTHER_REF = '2b4e28ba-2fa1-41d2-883f-0016d3cca428';
+for (const method of ['qr', 'code']) {
+    test(`${method}: a competing account cannot replace the owner, including while generation awaits`, async (t) => {
+        let release, entered;
+        const started = new Promise(resolve => { entered = resolve; });
+        const wait = new Promise(resolve => { release = resolve; });
+        const generate = async () => { entered(); await wait; return method === 'qr'
+            ? { status: 200, qr: 'private-qr' } : { code: 'AAAA-BBBB' }; };
+        const { call, state } = await startBridge(t, {
+            ...(method === 'qr' ? { getTempQr: generate } : { requestPairingCode: generate }),
+        });
+        const body = { pairingRef: REF, method, ...(method === 'code' ? { phone: SESSION } : {}) };
+        const first = call('POST', '/bridge/pair', body);
+        await started;
+        const competitor = await call('POST', '/bridge/pair', { ...body, pairingRef: OTHER_REF });
+        assert.equal(competitor.status, 409);
+        assert.equal(competitor.json.error.code, 'pairing_busy');
+        assert.equal(state.getPairingRef(method === 'qr' ? 'temp_qr' : SESSION), REF);
+        release();
+        assert.equal((await first).status, 200);
+        assert.equal((await call('POST', '/bridge/pair', { ...body, pairingRef: OTHER_REF })).status, 409);
+    });
+}
+
+test('QR lease refresh keeps its deadline; next owner gets a fresh socket after expiry', async (t) => {
+    const resets = [];
+    const { call, state, clock } = await startBridge(t, { resetPairingSession: session => resets.push(session) });
+    const body = { method: 'qr', pairingRef: REF };
+    assert.equal((await call('POST', '/bridge/pair', body)).status, 200);
+    const at = state.getPairingLease('temp_qr').at;
+    clock.now += 60_000;
+    assert.equal((await call('POST', '/bridge/pair', body)).status, 200);
+    assert.equal(state.getPairingLease('temp_qr').at, at);
+    clock.now += 60_001;
+    assert.equal((await call('POST', '/bridge/pair', body)).json.error.code, 'pairing_expired');
+    assert.equal((await call('POST', '/bridge/pair', { ...body, pairingRef: OTHER_REF })).status, 200);
+    assert.deepEqual(resets, ['temp_qr', 'temp_qr']);
+    assert.equal(state.getPairingRef('temp_qr'), OTHER_REF);
+});
+
+test('6 and 7 digit pairing numbers are rejected before generating a code', async (t) => {
+    const { call, pairingCalls } = await startBridge(t);
+    for (const phone of ['123456', '1234567']) {
+        const result = await call('POST', '/bridge/pair', { method: 'code', phone, pairingRef: REF });
+        assert.equal(result.status, 400);
+    }
+    assert.deepEqual(pairingCalls, []);
+});
+
+test('cancellation is owner-scoped and permits immediate retry with fresh credentials', async (t) => {
+    const resets = [];
+    const { call, state } = await startBridge(t, { resetPairingSession: session => resets.push(session) });
+    await call('POST', '/bridge/pair', { method: 'qr', pairingRef: REF });
+    await call('POST', '/bridge/pair/cancel', { method: 'qr', pairingRef: OTHER_REF });
+    assert.equal(state.getPairingRef('temp_qr'), REF);
+    assert.equal(resets.length, 1);
+    assert.equal((await call('POST', '/bridge/pair/cancel', { method: 'qr', pairingRef: REF })).status, 200);
+    assert.equal(state.getPairingRef('temp_qr'), null);
+    assert.equal((await call('POST', '/bridge/pair', { method: 'qr', pairingRef: OTHER_REF })).status, 200);
+    assert.equal(resets.length, 3);
 });

@@ -64,6 +64,7 @@ function createWacrmClient({
     let retryTimer = null;
     let retryDelay = retryBaseMs;
     let draining = false;
+    let flushing = false;
     let warnedUnconfigured = false;
 
     function loadQueue() {
@@ -122,8 +123,18 @@ function createWacrmClient({
         const events = pending.get(session) || [];
         events.push(event);
         pending.set(session, events);
-        if (events.length >= MAX_EVENTS_PER_BATCH) flush();
-        else if (!flushTimer) flushTimer = unref(setTimeout(flush, flushDelayMs));
+        if (type === 'connection' || events.length >= MAX_EVENTS_PER_BATCH) {
+            if (type === 'connection' && retryTimer) {
+                // Connection events complete pairing: don't trap them behind an
+                // earlier 5-minute backoff from a transient wacrm hiccup.
+                clearTimeout(retryTimer);
+                retryTimer = null;
+                retryDelay = retryBaseMs;
+            }
+            flush();
+        } else if (!flushTimer) {
+            flushTimer = unref(setTimeout(flush, flushDelayMs));
+        }
         return event.eventId;
     }
 
@@ -131,22 +142,27 @@ function createWacrmClient({
     function flush() {
         clearTimeout(flushTimer);
         flushTimer = null;
-        if (pending.size === 0) return;
-        const q = loadQueue();
-        fs.mkdirSync(path.dirname(outboxFile), { recursive: true });
-        for (const [session, events] of pending) {
-            for (let i = 0; i < events.length; i += MAX_EVENTS_PER_BATCH) {
-                const batch = { protocol: '1', session, createdAt: now(), events: events.slice(i, i + MAX_EVENTS_PER_BATCH) };
-                q.push(batch);
-                fs.appendFileSync(outboxFile, JSON.stringify(batch) + '\n', 'utf8');
+        if (pending.size === 0 || flushing) return;
+        flushing = true;
+        try {
+            const q = loadQueue();
+            fs.mkdirSync(path.dirname(outboxFile), { recursive: true });
+            for (const [session, events] of pending) {
+                for (let i = 0; i < events.length; i += MAX_EVENTS_PER_BATCH) {
+                    const batch = { protocol: '1', session, createdAt: now(), events: events.slice(i, i + MAX_EVENTS_PER_BATCH) };
+                    q.push(batch);
+                    fs.appendFileSync(outboxFile, JSON.stringify(batch) + '\n', 'utf8');
+                }
             }
-        }
-        pending.clear();
-        if (q.length > MAX_QUEUED_BATCHES) {
-            const overflow = q.splice(0, q.length - MAX_QUEUED_BATCHES);
-            for (const batch of overflow) appendDeadLetter({ reason: 'outbox_full', batch });
-            persistQueue();
-            log.error(`[bridge] Outbox full — moved ${overflow.length} oldest batch(es) to the dead letter.`);
+            pending.clear();
+            if (q.length > MAX_QUEUED_BATCHES) {
+                const overflow = q.splice(0, q.length - MAX_QUEUED_BATCHES);
+                for (const batch of overflow) appendDeadLetter({ reason: 'outbox_full', batch });
+                persistQueue();
+                log.error(`[bridge] Outbox full — moved ${overflow.length} oldest batch(es) to the dead letter.`);
+            }
+        } finally {
+            flushing = false;
         }
         void drain();
     }
