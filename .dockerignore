@@ -1,0 +1,9 @@
+node_modules
+.git
+.next
+wacrm
+antisnowflake-bot-main/node_modules
+antisnowflake-bot-main/data/sessions/*
+!antisnowflake-bot-main/data/sessions/.gitkeep
+antisnowflake-bot-main/tmp/*
+antisnowflake-bot-main/temp/*
