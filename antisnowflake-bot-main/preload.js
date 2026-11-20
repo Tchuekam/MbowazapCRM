@@ -11,6 +11,10 @@
  */
 
 require('dotenv').config();
+const dns = require('dns');
+try {
+    dns.setDefaultResultOrder('ipv4first');
+} catch (_) {}
 const Module = require('module');
 const path = require('path');
 
@@ -30,7 +34,15 @@ const forbiddenLogs = [
 ];
 
 console.log = function(...args) {
-    const logStr = args.map(arg => typeof arg === 'string' ? arg : JSON.stringify(arg)).join(' ');
+    const logStr = args.map(arg => {
+        if (typeof arg === 'string') return arg;
+        if (arg instanceof Error) return arg.stack || arg.message || String(arg);
+        try {
+            return JSON.stringify(arg);
+        } catch (_) {
+            return String(arg);
+        }
+    }).join(' ');
     if (forbiddenLogs.some(forbidden => logStr.includes(forbidden))) {
         return; // Suppress
     }

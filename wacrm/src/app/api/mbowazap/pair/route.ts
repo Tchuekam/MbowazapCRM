@@ -34,7 +34,7 @@ async function requestPairing(
   request: PairRequest
 ): Promise<PairResult> {
   const deadline = Date.now() + PAIRING_PENDING_BUDGET_MS;
-  for (;;) {
+  for (; ;) {
     try {
       return await client.pair(request);
     } catch (err) {
@@ -148,11 +148,9 @@ export async function POST(req: NextRequest) {
     const client = createMbowazapClient(envResult.env);
 
     let previousWasDisconnectedOnBot = false;
-    if (
-      existingConfig?.mbowazap_state === 'connected' &&
-      existingConfig.mbowazap_session
-    ) {
-      if (await isStillLinkedOnBot(client, existingConfig.mbowazap_session)) {
+    if (existingConfig?.mbowazap_session) {
+      const stillLinked = await isStillLinkedOnBot(client, existingConfig.mbowazap_session);
+      if (existingConfig.mbowazap_state === 'connected' && stillLinked) {
         return NextResponse.json(
           {
             ok: false,
@@ -162,7 +160,13 @@ export async function POST(req: NextRequest) {
           { status: 409 }
         );
       }
-      previousWasDisconnectedOnBot = true;
+      if (!stillLinked) {
+        previousWasDisconnectedOnBot = true;
+        try {
+          await client.disconnect(existingConfig.mbowazap_session);
+        } catch (_) {}
+      }
+    }
     }
 
     const pairingRef = crypto.randomUUID();
